@@ -1,0 +1,734 @@
+---
+title: "MovieLens Capstone Project"
+author: "Can Zhang"
+output:
+  pdf_document: default
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, cache = TRUE)
+
+library(tidyverse)
+library(dplyr)
+library(caret)
+library(stringr)
+library(ranger)
+library(recosystem)
+library(magrittr)
+library(data.table)
+```
+
+
+# Introduction
+
+Recommendation system is one of the most popular applications of machine learning. It is widely used by companies such as Netflix, Amazon and YouTube to predict user preference in order to create highly personalized customer experience.
+
+The MovieLens project is part of the Data Science Professional Certificate program offered by Harvard University through edX platform.
+The aim of the project is to create and train a recommendation algorithm to predict ratings given by certain users to specific movies. The Residual Mean Square Error (RMSE) is used to evaluate the accuracy of the algorithm. The goal is to achieve a RMSE smaller than 0.86490.
+
+Six models were built for this project:
+
+1. Baseline(to predict the average rating of all movies as expected rating)
+2. Baseline + movie effect
+3. Baseline + movie effect + user effect
+4. Baseline + regularized movie effect + regularized user effect
+5. Baseline + movie effect + user effect + Random Forest(ranger)
+6. Matrix factorization(recosystem)
+
+The best performing model - the matrix factorization model - is used for the final validation, which yielded a RMSE of 0.7861099(well below the target RMSE 0.86490).
+
+This report will present an overview of the data set, the model building process, the results of the models and final validation, and the conclusion of this project.
+
+# The data set
+
+The data set used in this project is the MovieLens 10M Dataset provided by Grouplens. Additional information of the data set can be found [here](https://grouplens.org/dataset/movielens/10m/).
+
+The following code is used to generate the train set and validation set(final hold-out test set).
+
+```{r echo=TRUE}
+dl <- tempfile()
+
+download.file("http://files.grouplens.org/datasets/movielens/ml-10m.zip", dl)
+
+ratings <- fread(text = gsub("::", "\t", readLines(unzip(dl, "ml-10M100K/ratings.dat"))),
+                 col.names = c("userId", "movieId", "rating", "timestamp"))
+
+movies <- str_split_fixed(readLines(unzip(dl, "ml-10M100K/movies.dat")), "\\::", 3)
+colnames(movies) <- c("movieId", "title", "genres")
+
+movies <- as.data.frame(movies) %>% mutate(movieId = as.numeric(movieId),
+                                            title = as.character(title),
+                                            genres = as.character(genres))
+
+movielens <- left_join(ratings, movies, by = "movieId")
+
+# Validation set will be 10% of MovieLens data
+set.seed(1, sample.kind="Rounding") # if using R 3.5 or earlier, use `set.seed(1)`
+test_index <- createDataPartition(y = movielens$rating, times = 1, p = 0.1, list = FALSE)
+edx <- movielens[-test_index,]
+temp <- movielens[test_index,]
+
+# Make sure userId and movieId in validation set are also in edx set
+validation <- temp %>%
+      semi_join(edx, by = "movieId") %>%
+      semi_join(edx, by = "userId")
+
+# Add rows removed from validation set back into edx set
+removed <- anti_join(temp, validation)
+edx <- rbind(edx, removed)
+
+rm(dl, ratings, movies, test_index, temp, movielens, removed)
+```
+
+# Data exploration
+
+The edx dataset contains 9000055 observations of 6 variables:
+
+1. userId, integer. Each userId represents a unique user.
+2. movieId, numeric.
+3. rating, numeric. According to the "README" file on grouplens.org, ratings are made on a 5-star scale, with half-star increments.The average of all ratings is 3.512.
+4. timestamp, integer. This variable originally comes from the "ratings" data file, therefore it represents the time when ratings were made. It uses Unix time, representing seconds since midnight Coordinated Universal Time (UTC) of January 1, 1970.
+5. title, character. It includes both the movie titles and year of release in brackets.
+6. genres, character. Each movie may be associated to more than one genre, separated by a pipe.
+
+```{r echo=TRUE}
+str(edx)
+```
+
+```{r echo=TRUE}
+summary(edx)
+```
+
+```{r echo=TRUE}
+head(edx)
+```
+
+There are 69878 unique users and 10677 unique movies in the edx data set.
+
+```{r echo=TRUE}
+library(dplyr)
+edx %>% summarise(n_unique_user = n_distinct(userId),
+                  n_uniqe_movie = n_distinct(movieId))
+```
+
+The three most frequent ratings given by users are 4, 3,and 5.
+
+```{r echo=TRUE}
+rating_frequency <- edx %>%
+  group_by(rating) %>%
+  summarise(count_rating = n()) %>%
+  arrange(desc(count_rating)) %>%
+    knitr::kable() 
+rating_frequency
+```
+
+## Movies and ratings
+
+There are not many movies which received more than 10000 ratings or less than 10 ratings. The distribution of number of ratings per movie is as follows:
+
+```{r echo=TRUE}
+ratings_per_movie <- edx %>%
+  group_by(movieId, title) %>%
+  summarise(count_ratings_per_movie = n()) %>%
+  arrange(desc(count_ratings_per_movie)) 
+
+ratings_per_movie %>% ggplot(aes(count_ratings_per_movie)) +
+  geom_histogram(color = "black", fill = "sky blue", bins = 30) +
+  scale_x_log10()+
+  ggtitle(" Number of ratings per movie")
+```
+
+Different movies received different ratings. By calculating the average rating that each movie received, we find that some movies received extremely high or low ratings, indicating there's a "movie effect" that we should consider.
+
+```{r echo=TRUE}
+final_rating_of_movies <- edx %>%
+  group_by(movieId, title) %>%
+  summarise(final_rating = mean(rating), count_rating = n()) %>%
+  arrange(desc(final_rating))
+```
+
+By checking the 10 best and 10 worst movies, we notice that most of those movies are very obscure, and most of them only received very few ratings. This is because with very few ratings, the ratings tend to be more extreme and more biased. So if we use these very small samples to make predictions, the error is likely very large. Therefore, we should try to regularize extreme estimates which are formed using small samples.
+
+```{r echo=TRUE}
+final_rating_of_movies[1:10,] %>% knitr::kable() 
+final_rating_of_movies[10667:10677,]%>% knitr::kable()
+```
+
+By plotting the rating of each movie against number of ratings they receive, we notice that the most frequently rated movies tend to have above average ratings. Therefore, the number of ratings may have an impact on the rating that a movie receives.
+
+```{r echo=TRUE}
+#plot rating of each movie against number of ratings they receive
+final_rating_of_movies %>%
+    ggplot(aes(final_rating, count_rating, group = final_rating)) +
+    geom_boxplot(color = "black") +
+    scale_y_log10()
+```
+
+## Users and ratings
+
+We know some people tend to be more generous than others when they rate movies. By taking a look of the average rating that each user give, we notice that some users give very high ratings to pretty much everything they watched, and some do the opposite. The variability across users implies "user effect" should be taken into consideration.
+
+```{r echo=TRUE}
+average_rating_of_user <- edx %>%
+  group_by(userId) %>%
+  summarise(avg_rating_of_user = mean(rating)) %>%
+  ggplot(aes(avg_rating_of_user)) +
+  geom_histogram(color = "black", fill = "sky blue", bins = 30) +
+  ggtitle("Average rating of each user")
+
+average_rating_of_user
+```
+
+Some users have rated very few movies compared to others.
+
+```{r echo=TRUE}
+ratings_per_user <- edx %>%
+  group_by(userId) %>%
+  summarise(count_ratings_per_user = n()) %>%
+  arrange(desc(count_ratings_per_user)) %>%
+  ggplot(aes(count_ratings_per_user)) +
+  geom_histogram(color = "black", fill = "sky blue", bins = 30) +
+  scale_x_log10()+
+  ggtitle(" Number of ratings per user")
+
+ratings_per_user
+```
+
+## Genres and ratings
+
+The movies in edx data set may be associated to more than one genre, separated by a pipe. With the following code, we split the "genres" variable and count how many movie ratings are in each genre.
+
+The 3 genres that received the most ratings are Drama, Comedy and Action.
+
+```{r echo=TRUE, paged.print = FALSE}
+edx_split_genre <- edx %>%
+    separate_rows(genres, sep = "\\|")
+
+ratings_per_genre <- edx_split_genre %>%
+  group_by(genres)%>%
+  summarise(count_ratings_per_genre = n()) %>%
+  arrange(desc(count_ratings_per_genre))
+ratings_per_genre
+```
+
+Now that we know some genres are more popular than others, we can explore if popular genres also receive higher ratings with the following code:
+
+```{r echo=TRUE}
+avg_rating_per_genre <- edx_split_genre %>%
+    group_by(genres) %>%
+    summarise(avg_rating = mean(rating)) %>%
+    left_join(ratings_per_genre, by = "genres") %>%
+    arrange(desc(avg_rating))
+
+avg_rating_per_genre %>%
+    ggplot(aes(count_ratings_per_genre, avg_rating, label = genres)) +
+    geom_point() +
+    geom_text(position = "nudge", vjust = -0.5) +
+    geom_smooth()
+```
+
+The three most popular genres(Drama, Comedy and Action) received average ratings. The genre "Film-noir" has the highest average rating, but the number of ratings it received is quite small compared to other genres. The rating of genre "Horror" is much lower than the average.The smoothed line is around 3.5, which is the average of all ratings. 
+
+## Year and ratings
+
+To explore the connection of year and ratings, we need to create a "year" variable by splitting the year of release from "title":
+
+```{r echo=TRUE}
+edx_split_year <- edx %>% 
+    mutate(year = as.numeric(str_sub(edx$title,-5, -2)))
+```
+
+With the following code, we calculate the number of ratings each year gets and the average rating each year gets.
+
+```{r echo=TRUE}
+edx_year_vs_rating <- edx_split_year %>% 
+    group_by(year) %>% 
+    mutate(count_rating_year = n(),
+           avg_rating_year = mean(rating)) %>% 
+    select(year, count_rating_year, avg_rating_year) %>% 
+    unique()
+```
+
+Then we plot average rating of each year against year, and set size to represent the number of ratings of each year.
+
+```{r echo=TRUE}
+edx_year_vs_rating %>% 
+    ggplot(aes(year, avg_rating_year, size = count_rating_year)) +
+    geom_point()
+```
+
+From the plot above, we can see that:
+
+1. The movies before 1980 generally got lower number of ratings but higher average ratings. 
+2. Roughly between 1980 and 1995, movies got more ratings but the average of ratings were much lower than the years before the 1980.
+3. Between 1995 and 2010, the number of ratings movies got were smaller than 1980-1995 but much bigger than before 1980. The average ratings showed an upward trend, but they were still lower than the years before 1980. 
+
+In short, the variable "year" might have an effect on the ratings of movie.
+
+# Model building
+
+## Generate training and test sets
+
+The following code is used to generate the training set and test set.
+```{r echo=TRUE}
+library(caret)
+set.seed(2, sample.kind = "Rounding")
+test_index <- createDataPartition(edx$rating, times = 1, p = 0.2, list = FALSE)
+test_set_temp <- edx[test_index, ]
+train_set <- edx[-test_index, ]
+
+# make sure userId and movieId in test set are also in train set
+test_set <- test_set_temp %>% 
+  semi_join(train_set, by = "movieId") %>% 
+  semi_join(train_set, by = "userId")
+
+# add rows removed from test set back into train set
+removed_rows <- anti_join(test_set_temp, test_set)
+train_set <- rbind(train_set, removed_rows)
+```
+
+## Create the loss function
+
+To compare different models, we use root mean squared error (RMSE) as the loss function.
+```{r echo=TRUE}
+RMSE <- function(true_ratings, predicted_ratings){
+  sqrt(mean((true_ratings - predicted_ratings)^2))
+}
+```
+
+## The first model: baseline
+
+Firstly, we try to predict the expected ratings with the average rating of all movies.
+
+If we use "mu" to represent the true rating for all movies, then the estimate that minimizes the RMSE is the average of all ratings.
+
+The equation of the first model can be written as follows:
+
+y_hat = mu_hat
+
+```{r echo=TRUE}
+mu_hat <- mean(train_set$rating)
+y_hat_1 <- mu_hat
+rmse_1 <- RMSE(test_set$rating,y_hat_1)
+rmse_results <- data.frame(Method = "Baseline(average of all ratings)", RMSE = rmse_1)
+```
+
+The RMSE of this model is `r rmse_1`.
+
+```{r echo=FALSE}
+rmse_first1 <- data.frame(Method = "Baseline(average of all ratings)", RMSE = rmse_1)
+rmse_first1
+```
+
+## The second model: baseline + movie effect
+
+While exploring data, we found that different movies are rated differently. We can improve the previous model by adding "movie effect"(b_i).
+
+We'll minimize the following equation to obtain the least squares estimate for movie effect:
+
+sum((true rating - mu_hat - b_i)^2)/N
+
+Therefore, the movie effect can be calculated as:
+
+b_i = mean(true rating - mu_hat)
+
+The equation of the second model can be written as follows:
+
+y_hat = mu_hat + b_i
+
+```{r echo=TRUE}
+movie_bias <- train_set %>%
+  group_by(movieId) %>%
+  summarise(b_i = mean(rating - mu_hat))
+
+min(movie_bias$b_i)
+max(movie_bias$b_i)
+```
+The highest value of b_i is 1.49 and the lowest value of b_i is -3.0, indicating that the highest rating is close to 5, and lowest is 0.5, which is in line with the data set.
+
+With the following code, we calculate first the expected ratings of the test set, then the RMSE.
+
+```{r echo=TRUE}
+b_i_test_set <- test_set %>%
+  left_join(movie_bias, by = "movieId") %>%
+  pull(b_i)
+
+y_hat_2 <- mu_hat + b_i_test_set
+
+rmse_2 <- RMSE(test_set$rating, y_hat_2)
+rmse_result_2 <- data.frame(Method = "Baseline + movie effect", RMSE = rmse_2)
+```
+
+The RMSE of this model is `r rmse_2`.
+
+```{r echo=FALSE}
+rmse_first2 <- rbind(rmse_first1,rmse_result_2)
+rmse_first2
+```
+
+## The third model: baseline + movie effect + user effect
+
+Next step, we try to account for the variability across users by adding "user effect"(b_u).
+
+User effect can be calculated as follows:
+
+b_u = mean(true rating - mu_hat - b_i)
+
+The equation of the third model can be written as follows:
+
+y_hat = mu_hat + b_i + b_u
+
+```{r echo=TRUE}
+user_bias <- train_set %>%
+  left_join(movie_bias, by = "movieId") %>%
+  group_by(userId) %>%
+  summarise(b_u = mean(rating - mu_hat - b_i))
+
+b_u_test_set <- test_set %>%
+  left_join(user_bias, by = "userId") %>%
+  pull(b_u)
+
+y_hat_3 <- mu_hat + b_i_test_set + b_u_test_set
+
+rmse_3 <- RMSE(test_set$rating, y_hat_3)
+rmse_result_3 <- data.frame(Method = "Baseline + movie effect + user effect", RMSE = rmse_3)
+
+```
+
+The RMSE of this model is `r rmse_3`. We improved a lot from the first model.
+
+```{r echo=FALSE}
+rmse_first3 <- rbind(rmse_first2,rmse_result_3)
+rmse_first3
+```
+
+## The fourth model: Baseline + regularized movie effect + regularized user effect
+
+In this model, we use regularized regression to control the total variability of the movie effect(b_i) and user effect(b_u). Specifically, instead of minimize the least squares:
+
+sum((true rating - mu_hat - b_i - b_u)^2)/N
+
+We add a penalty, and try to minimize the following equation:
+
+sum((true rating - mu_hat - b_i - b_u)^2)/N + lambda*sum(b_i^2 + b_u^2)
+
+The b_i and b_u that minimize the above equation can be calculated as:
+
+b_i_reg = sum(true rating - mu_hat)/(lambda+N)
+
+b_u_reg = sum(true rating - mu_hat - b_i_reg)/(lambda+N)
+
+Note that N is the number of ratings for a certain movie. When N is small, lambda has a significant impact in shrinking the bias, when N is large, the lambda can be almost ignored.
+
+The equation of the fourth model can be written as follows:
+
+y_hat = mu_hat + b_i_reg + b_u_reg
+
+```{r echo=TRUE}
+lambdas <- seq(0,10,0.25)
+
+rmses_lambdas <- sapply(lambdas, function(x){
+    movie_bias_regularized <- train_set %>%
+        group_by(movieId) %>%
+        summarise(b_i_reg = sum(rating - mu_hat)/(n()+x))
+    user_bias_regularized <- train_set %>%
+        left_join(movie_bias_regularized, by = "movieId") %>%
+        group_by(userId) %>%
+        summarise(b_u_reg = sum(rating - mu_hat - b_i_reg)/(n()+x))
+    y_hat_reg <- test_set %>%
+        left_join(movie_bias_regularized, by = "movieId") %>%
+        left_join(user_bias_regularized, by = "userId") %>%
+        mutate(y_hat = mu_hat + b_i_reg + b_u_reg) %>%
+        pull(y_hat)
+    rmse_reg <- RMSE(test_set$rating, y_hat_reg)
+    rmse_reg
+})
+
+qplot(lambdas,rmses_lambdas)
+```
+
+We use cross validation to get the best lambda, which is 5.
+
+```{r echo=TRUE}
+best_lambda <- lambdas[which.min(rmses_lambdas)]
+best_lambda
+```
+
+```{r echo=TRUE}
+rmse_4 <- rmses_lambdas[which.min(rmses_lambdas)]
+rmse_result_4 <- data.frame(Method = "Baseline + regularized movie effect + regularized user effect", RMSE = rmse_4)
+```
+
+The RMSE of this model is `r rmse_4`. We only got a tiny improvement from the previous model.
+
+```{r echo=FALSE}
+rmse_first4 <- rbind(rmse_first3,rmse_result_4)
+rmse_first4
+```
+
+
+## The fifth model: Baseline + movie effect + user effect + random forest(ranger)
+
+In data exploration, we find that the year of release and genres of a movie may have an impact on the rating. Therefore, in this model, we'll try to use random forest to estimate the effect of "year" and "genre" on the residual of the ratings. Since random forest is too slow to run on a personal computer, we opt for a much faster implementation of random forest: ranger.
+
+### Calculate the residual of train set
+
+First, we calculate the residual of train set by removing baseline, movie effect and user effect.
+
+Then the residual can be calculated as follows:
+
+residual = true rating - mu_hat - b_i - b_u
+
+```{r echo=TRUE}
+residual_train <- train_set %>%
+    left_join(movie_bias, by = "movieId") %>%
+    mutate(resi_1 = rating - b_i) %>%
+    left_join(user_bias, by = "userId") %>%
+    mutate(residual = resi_1 - b_u - mu_hat) %>%
+    select(userId, movieId, rating, title, genres, residual)
+```
+
+### Split "year" and "genre" of train set, and reshape train set from long to wide
+
+In order to used the "ranger" package, we need to:
+
+1. Split the year of release from "title" variable, and separate the "genres" variable into single genres.
+
+2. Reshape the data set from long to wide.
+
+```{r echo=TRUE}
+residual_train_split <- residual_train %>%
+  mutate(year = as.numeric(str_sub(title,-5, -2))) %>%
+  separate_rows(genres, sep = "\\|") %>%
+  mutate(genre_count = 1L) %>%
+  pivot_wider(names_from = genres, values_from = genre_count, values_fill = 0L)
+head(residual_train_split)
+```
+
+After the above operations, we make sure that the order of rows remains unchanged.
+
+```{r echo=TRUE}
+sum(residual_train_split$movieId != train_set$movieId)
+sum(residual_train_split$userId != train_set$userId)
+```
+
+### Format the train set for ranger
+
+In this step, we prepare the data set for ranger package by:
+
+1. removing userId, movieId, rating, title;
+
+2. replacing minus signs in column names to underscore;
+
+3. replacing "(no genres listed)" with "NoGenre".
+
+We write a function with the following code:
+
+```{r echo=TRUE}
+format_ranger <- function(x){
+    x <- x[,!(colnames(x) %in% c("userId", "movieId", "rating", "title"))]
+    colnames(x) <- gsub("\\-", "", colnames(x))
+    colnames(x) <- gsub("^[(]no\\sgenres\\slisted[)]$", "NoGenre", colnames(x))
+    x
+}
+
+```
+
+Then we format the "residual_train_split" data set into ranger format.
+
+```{r echo=TRUE}
+residual_train_split_ranger <- format_ranger(residual_train_split)
+head(residual_train_split_ranger)
+```
+
+### Train a model with ranger on train set
+
+With the following code, we fit a model on the train set.
+
+```{r echo=TRUE, message = FALSE}
+library(ranger)
+fit_ranger <- ranger(residual ~ ., data = residual_train_split_ranger)
+```
+
+### Format the test set
+
+We prepare the test set into the ranger format:
+
+```{r}
+test_split <- test_set %>%
+    mutate(year = as.numeric(str_sub(title, -5, -2))) %>%
+    separate_rows(genres, sep = "\\|") %>%
+    mutate(genre_count = c(1)) %>%
+    pivot_wider(names_from = genres, values_from = genre_count, values_fill = 0)
+
+sum(test_split$movieId != test_set$movieId)
+sum(test_split$userId != test_set$userId)
+
+test_split_ranger <- test_split %>% format_ranger()
+```
+
+### Prediction
+
+With the fitted model, we predict the residual of test set and calculate the RMSE.
+
+```{r echo=TRUE}
+pred_ranger <-predict(fit_ranger, data = test_split_ranger)
+y_hat_residual <- pred_ranger$predictions
+
+y_hat_ranger <- test_split %>%
+    left_join(movie_bias, by = "movieId") %>%
+    left_join(user_bias, by = "userId") %>%
+    mutate(y_hat = mu_hat + b_i + b_u + y_hat_residual) %>%
+    pull(y_hat)
+
+rmse_ranger <- RMSE(test_set$rating, y_hat_ranger)
+rmse_ranger
+
+rmse_result_ranger <- data.frame(Method = "Baseline + regularized movie effect + regularized user effect + random forest (ranger)", RMSE = rmse_ranger)
+```
+
+The RMSE of this model is  `r rmse_ranger`, which is slightly worse than the previous model, and still doesn't meet our goal(RMSE<0.86490).
+
+```{r echo=FALSE}
+rmse_first5 <- rbind(rmse_first4, rmse_result_ranger)
+rmse_first5
+```
+
+
+## The sixth model: matrix factorization(recosystem)
+
+Our previous models lowered the RMSE to around 0.866, still higher than the goal(RMSE < 0.86490). We need to find a better model for this task.
+
+The data set of this project is quite unique: the data is very "loose" as there are a lot of missing values. However, we know that similar users might have similar tastes, and similar movies might get similar ratings. Thus the missing values can be predicted using the actual ratings in the data set. A popular method to solve this problem is the matrix factorization model.
+
+The package we choose to use for this project is the recosystem package, a wrapper of the "libmf" library for recommender system using matrix factorization. For details of this package, please click [here](https://cran.r-project.org/web/packages/recosystem/vignettes/introduction.html).
+
+### Format train set and test set
+
+The recosystem package requires the data to be in sparse matrix triplet form. With the following code, we convert both the train set and test set into the recosystem format.
+
+```{r echo=TRUE}
+library(recosystem)
+train_fac <- with(train_set, data_memory(user_index = userId,
+                                         item_index = movieId,
+                                         rating = rating))
+
+
+test_fac <- with(test_set, data_memory(user_index = userId,
+                                        item_index = movieId,
+                                        rating = rating))
+```
+
+### Create a model object and tune the parameters
+
+```{r echo=TRUE}
+#create a model object by calling Reco()
+set.seed(345, sample.kind = "Rounding")
+r <- Reco()
+#tuning the parameters
+opts <- r$tune(train_fac, opt = list(dim = c(10L, 20L),
+                                     lrate = c(0.01, 0.1),
+                                     costp_l2 = c(0.01, 0.1),
+                                     costq_l2 = c(0.01, 0.1),
+                                     nthread = 4,
+                                     niter = 40))
+```
+
+### Train the model
+
+Train the model using the best tuning parameters from the previous step.
+
+```{r echo=TRUE}
+r$train(train_fac, opts = c(opts$min, nthread = 4, niter = 40))
+```
+
+### Prediction
+
+We compute the predicted values and store the prediction to a R vector, then calculate the RMSE.
+
+```{r echo=TRUE}
+y_hat_fac <- r$predict(test_fac, out_memory())
+head(y_hat_fac)
+
+rmse_fac <- RMSE(test_set$rating, y_hat_fac)
+rmse_result_fac <- data.frame(Method = "Matrix factorization (recosystem)", RMSE = rmse_fac)
+```
+
+```{r echo=FALSE}
+rmse_first6 <- rbind(rmse_first5,rmse_result_fac)
+rmse_first6
+```
+
+The RMSE of this model is `r rmse_fac`. We made significant improvement from all previous models.
+
+# Results and final validation
+
+The following six models are tested for this project:
+
+```{r echo=FALSE}
+rmse_first6
+```
+
+The best performing model is the last one: Matrix factorization using recosystem package. We'll use this model for our final validation.
+
+## Final Validation
+
+First, we'll train it with edx data set:
+
+```{r echo=TRUE}
+##transform the edx and validation data sets to sparse matrix triplet form.
+edx_fac <- with(edx, data_memory(user_index = userId,
+                                       item_index = movieId,
+                                       rating = rating))
+validation_fac <- with(validation, data_memory(user_index = userId,
+                                              item_index = movieId,
+                                              rating = rating))
+
+##create a model object by calling Reco()
+set.seed(3456, sample.kind = "Rounding")
+r_edx <- Reco()
+
+##tune the parameters
+opts_edx <- r$tune(edx_fac, opt = list(dim = c(10L, 20L),
+                                       lrate = c(0.01, 0.1),
+                                       costp_l2 = c(0.01, 0.1),
+                                       costq_l2 = c(0.01, 0.1),
+                                       nthread = 6,
+                                       niter = 40))
+
+## train the model by calling the $train() method
+r_edx$train(edx_fac, opts = c(opts_edx$min, nthread = 6, niter = 40))
+```
+
+Then, we calculate the final RMSE on the validation data set.
+
+```{r echo=TRUE}
+##use the $predict() method to compute predicted values
+##and generate prediction to a R vector
+y_hat_edx_fac <- r_edx$predict(validation_fac, out_memory())
+
+##calculate the final RMSE
+rmse_final <- RMSE(validation$rating, y_hat_edx_fac)
+rmse_result_final <- data.frame(Method = "Matrix Factorization (Final Validation)", RMSE = rmse_final)
+```
+
+The final RMSE is `r rmse_final`.
+```{r echo=FALSE}
+rmse_result_final
+```
+
+
+# Conclusion
+
+For this project, we created six models to build a recommendation system. The best model (matrix factorization) achieved a RMSE of 0.7861099, well below the target RMSE 0.86490.
+
+These models we used have their limitations. For instance, after we accounted for the movie and user bias, we used ranger to make a prediction on the "residual" based on "year of release" and "genre". This only gave us a tiny improvement on the prediction. Due to limited time and resources(an old personal laptop), we didn't continue testing the effect of other variables on the residual, for example, the "timestamp" that indicates the time when ratings were made.
+
+With more time and better hardware, a few more approaches could be tested out:
+
+* Text analysis.
+  + We could extract words from the "title" variable, run sentiment analysis of them and look for correlation between certain sentiments and the ratings.
+  + We could check if there's a connection between the length of the titles and the ratings.
+* Tuning parameters. Especially with the ranger and recosystem models, we could spend more time tuning the parameters to find the best options that lowers the RMSE even more.
